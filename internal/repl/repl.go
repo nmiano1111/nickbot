@@ -4,11 +4,15 @@ package repl
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
+	"nickbot/internal/agent"
 	"nickbot/internal/model"
+	"nickbot/internal/tools"
 )
 
 const (
@@ -16,19 +20,30 @@ const (
 	reset = "\x1b[0m"
 )
 
-// REPL runs an interactive chat session against a model.
+// REPL runs an interactive chat session against an agent.
 type REPL struct {
-	model   model.Model
+	agent   *agent.Agent
 	label   string
 	system  string
 	history []model.Message
+
+	out io.Writer
+	// per-turn streaming state, reset by onTurnStart.
+	turnThinking  bool
+	turnAnswering bool
 }
 
-// New returns a REPL ready to Run. label is a display string describing the
-// model/backend, shown in the startup banner. system, if non-empty, is sent
-// as the system prompt at the start of every conversation.
-func New(m model.Model, label, system string) *REPL {
-	r := &REPL{model: m, label: label, system: system}
+// New returns a REPL ready to Run. It wires itself up as a's streaming and
+// tool-event callbacks. label is a display string describing the
+// model/backend, shown in the startup banner. system, if non-empty, is
+// sent as the system prompt at the start of every conversation.
+func New(a *agent.Agent, label, system string) *REPL {
+	r := &REPL{agent: a, label: label, system: system}
+	a.OnTurnStart = r.onTurnStart
+	a.OnThinking = r.onThinking
+	a.OnContent = r.onContent
+	a.OnToolCall = r.onToolCall
+	a.OnToolResult = r.onToolResult
 	r.resetHistory()
 	return r
 }
@@ -40,10 +55,11 @@ func (r *REPL) resetHistory() {
 	}
 }
 
-// Run reads user input from in, prints replies (and streamed thinking
-// tokens) to out, and blocks until in is exhausted, ctx is canceled, or
-// /exit is entered.
+// Run reads user input from in, prints replies (thinking tokens, tool
+// calls, and the final answer) to out, and blocks until in is exhausted,
+// ctx is canceled, or /exit is entered.
 func (r *REPL) Run(ctx context.Context, in io.Reader, out io.Writer) error {
+	r.out = out
 	fmt.Fprintf(out, "nickbot — chatting with %s\n", r.label)
 	fmt.Fprintln(out, "Type your message and press Enter. Ctrl+D or /exit to quit, /reset to clear history.")
 
@@ -69,47 +85,78 @@ func (r *REPL) Run(ctx context.Context, in io.Reader, out io.Writer) error {
 			continue
 		}
 
+		beforeLen := len(r.history)
 		r.history = append(r.history, model.Message{Role: "user", Content: input})
 
-		reply, err := r.exchange(ctx, out)
+		_, err := r.agent.Run(ctx, &r.history)
+		r.closeThinkingIfBare()
+		fmt.Fprintln(out)
 		if err != nil {
 			fmt.Fprintf(out, "error: %v\n", err)
-			r.history = r.history[:len(r.history)-1]
-			continue
+			r.history = r.history[:beforeLen]
 		}
-		r.history = append(r.history, model.Message{Role: "assistant", Content: reply})
 	}
 }
 
-// exchange sends the current history to the model and streams the reply to
-// out, dimming thinking tokens and switching to normal style for content.
-func (r *REPL) exchange(ctx context.Context, out io.Writer) (string, error) {
-	fmt.Fprint(out, "\n")
-	var thinking, answering bool
+func (r *REPL) onTurnStart() {
+	r.turnThinking = false
+	r.turnAnswering = false
+}
 
-	onThinking := func(tok string) {
-		if !thinking {
-			fmt.Fprint(out, dim)
-			thinking = true
-		}
-		fmt.Fprint(out, tok)
+func (r *REPL) onThinking(tok string) {
+	if !r.turnThinking {
+		fmt.Fprint(r.out, "\n"+dim)
+		r.turnThinking = true
 	}
-	onContent := func(tok string) {
-		if thinking && !answering {
-			fmt.Fprint(out, reset+"\n\n")
-		}
-		answering = true
-		fmt.Fprint(out, tok)
-	}
+	fmt.Fprint(r.out, tok)
+}
 
-	resp, err := r.model.Chat(ctx, model.ChatRequest{
-		Messages:   r.history,
-		OnThinking: onThinking,
-		OnContent:  onContent,
-	})
-	if thinking && !answering {
-		fmt.Fprint(out, reset)
+func (r *REPL) onContent(tok string) {
+	if r.turnThinking && !r.turnAnswering {
+		fmt.Fprint(r.out, reset+"\n\n")
+	} else if !r.turnAnswering {
+		fmt.Fprint(r.out, "\n")
 	}
-	fmt.Fprintln(out)
-	return resp.Message.Content, err
+	r.turnAnswering = true
+	fmt.Fprint(r.out, tok)
+}
+
+// closeThinkingIfBare resets the dim style if the current turn streamed
+// thinking tokens but never followed up with content (e.g. it went
+// straight to a tool call, or the loop ended mid-turn).
+func (r *REPL) closeThinkingIfBare() {
+	if r.turnThinking && !r.turnAnswering {
+		fmt.Fprint(r.out, reset)
+	}
+}
+
+func (r *REPL) onToolCall(name string, args json.RawMessage) {
+	r.closeThinkingIfBare()
+	fmt.Fprintf(r.out, "\n● %s(%s)\n", name, formatArgs(args))
+}
+
+func (r *REPL) onToolResult(_ string, result tools.ToolResult) {
+	if result.IsError {
+		fmt.Fprintf(r.out, "  ⚠ %s\n", result.Content)
+	}
+}
+
+// formatArgs renders a tool call's JSON arguments as compact "k=v, k2=v2"
+// text for the transcript, falling back to the raw JSON if it isn't a
+// simple object.
+func formatArgs(raw json.RawMessage) string {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil || len(m) == 0 {
+		return strings.TrimSpace(string(raw))
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s=%v", k, m[k])
+	}
+	return strings.Join(parts, ", ")
 }
